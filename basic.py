@@ -10,6 +10,7 @@ class Robot:
     def __init__(self, p, robotId):
         self.p = p
         self.robotId = robotId
+        self.time_step = 1/240.0
 
     def get_base_position(self):
         base_positon, base_orientation = p.getBasePositionAndOrientation(
@@ -68,32 +69,82 @@ class Robot:
             velocity.append(joint_state["velocity"])
         return (position, velocity)
 
-    def computeGravityCompensationControl(self, jointIds):
-        curr_pos, _ = self.getPositionVelocity(jointIds)
-        grav_comp_torque = self.p.calculateInverseDynamics(self.robotId, [0]*6+[1]+curr_pos,
-                                                           [0] * 19,
-                                                           [0] * 19, flags=1)
-        return grav_comp_torque
+    def ik_leg(self, leg_index, ee):
+        angles = []
+        angles = p.calculateInverseKinematics(
+            self.robotId, (leg_index+1)*5, ee)
+        if (leg_index == 0):
+            return (angles[0:3])
+        elif (leg_index == 1):
+            return (angles[3:6])
+        elif (leg_index == 2):
+            return (angles[6:9])
+        elif (leg_index == 3):
+            return (angles[9:12])
+        return angles
 
-    def computeRBDInertiaMatrixAndNonLinearEffects(self, joint_pos, joint_vel):
-        rbd_inertia_matrix = self.p.calculateMassMatrix(
-            self.robotId, list(joint_pos))
-        rbd_non_linear_effects = self.p.calculateInverseDynamics(
-            self.robotId, joint_pos, joint_vel, [0.0] * 19)
-        return np.asarray(rbd_inertia_matrix), np.asarray(rbd_non_linear_effects)
+    def getJointStates(self):
+        joint_states = p.getJointStates(
+            self.robotId, self.getcontrollablejointIds())
+        joint_positions = [state[0] for state in joint_states]
+        joint_velocities = [state[1] for state in joint_states]
+        joint_torques = [state[3] for state in joint_states]
+        return joint_positions, joint_velocities, joint_torques
 
-    def computeForwardDynamics(self, joint_pos, joint_vel, torque, is_using_damping=False):
-        [rbd_inertia_matrix, rbd_non_linear_effects
-         ] = self.computeRBDInertiaMatrixAndNonLinearEffects(joint_pos, joint_vel)
+    def calculateDynamicMatrices(self):
+        joint_pos, joint_vel, _ = self.getJointStates()
+        n_dof = len(self.getcontrollablejointIds())
+        InertiaMatrix = np.asarray(
+            p.calculateMassMatrix(self.robotId, joint_pos))
+        GravityMatrix = np.asarray(p.calculateInverseDynamics(
+            self.robotId, [0]*6+[1]+joint_pos, [0.0] * (n_dof+7), [0.0] * (n_dof+7), flags=1))
+        CoriolisMatrix = np.asarray(p.calculateInverseDynamics(
+            self.robotId, [0]*6+[1]+joint_pos, [0.0]*7+joint_vel, [0.0] * (n_dof+7), flags=1)) - GravityMatrix
+        return InertiaMatrix, GravityMatrix, CoriolisMatrix
 
-        temp = torque - rbd_non_linear_effects
+    def getTrajectory(self, thi, thf, tf, dt):
+        desired_position, desired_velocity, desired_acceleration = [], [], []
+        t = 0
+        while t <= tf:
+            # th = thi+((thf-thi)/tf)*(t-(tf/(2*np.pi))*np.sin((2*np.pi/tf)*t))
+            th = [0]*12
+            dth = [0]*12
+            ddth = [0]*12
+            desired_position.append(th)
+            desired_velocity.append(dth)
+            desired_acceleration.append(ddth)
+            t += dt
+        desired_position = np.array(desired_position)
+        desired_velocity = np.array(desired_velocity)
+        desired_acceleration = np.array(desired_acceleration)
+        return desired_position, desired_velocity, desired_acceleration
 
-        if is_using_damping:
-            damping_const = 0.5  # from URDF
-            temp -= damping_const * np.array(joint_vel)
-        qdd = list(np.matmul(np.linalg.inv(
-            rbd_inertia_matrix), (temp).reshape(19)))
-        return qdd
+    def doInverseDynamics(self, th_initial, th_final, final_time=2):
+        self.p.setRealTimeSimulation(False)
+        q_d, dq_d, ddq_d = self.getTrajectory(
+            th_initial, th_final, tf=final_time, dt=self.time_step)
+        traj_points = q_d.shape[0]
+        print('#Trajectory points:', traj_points)
+        # kd = 0.7
+        n = 0
+        while n < traj_points:
+            tau = self.p.calculateInverseDynamics(
+                self.robotId, [0]*6+[1]+list(q_d[n]), [0]*7+list(dq_d[n]), [0]*7+list(ddq_d[n]), flags=1)
+            # tau += kd * dq_d[n] #if joint damping is turned off, this torque will not be required
+            # print(tau)
+            tau = tau[7:]
+            # torque control
+            p.setJointMotorControlArray(self.robotId, self.getcontrollablejointIds(),
+                                        controlMode=self.p.TORQUE_CONTROL,
+                                        forces=tau)
+            theta, _, _ = self.getJointStates()
+            print('n:{}::th:{}'.format(n, theta))
+
+            p.stepSimulation()
+            time.sleep(self.time_step)
+            n += 1
+        print('Desired joint angles:', th_final)
+        # self.p.disconnect()
 
 
 if __name__ == "__main__":
@@ -121,48 +172,18 @@ if __name__ == "__main__":
     jointIds = robot.getcontrollablejointIds()
     robot.disableVelocityControl(jointIds)
     robot.enableTorqueControl(jointIds)
-    joint_config = [
-        0.03, 0.4, -0.8, 0,   # LF
-        -0.03, 0.4, -0.8, 0,  # RF
-        0.03, -0.4, 0.8, 0,   # LH
-        -0.03, -0.4, 0.8, 0,  # RH
-        0
-    ]
-    # print(robot.getJacobian())
-    # mass matrix is 18x18 shape
+
     prev_qd = [0.0]*12
     time_count = 0
     applied_torque = None
     while True:
-        [q, qd] = robot.getPositionVelocity(jointIds)
-        qdd = list((np.array(qd) - np.array(prev_qd))/dt)
-        # torques = p.calculateInverseDynamics(
-        #     robotId, [0]*6+[1]+joint_config, [0.0]*19, [0.0]*19, flags=1 | p.URDF_USE_INERTIA_FROM_FILE)
-        # torques_req = torques[7:]
-        print("time_count = ", time_count)
-        print("q   = ", np.array(q))
-        print("qd  = ", np.array(qd))
-        print("qdd = ", np.array(qdd))
-        print('')
-        bullet_tau = np.array(p.calculateInverseDynamics(
-            robotId, [0]*6+[1] + q, [0]*7 + qd, [0]*7+qdd, flags=1))
-
-        grav_comp_torque = robot.computeGravityCompensationControl(jointIds)
-        applied_torque = -np.array(
-            grav_comp_torque[7:])+np.array(bullet_tau[7:])
-        # print(torques_req)
-        # final_torques = []
-        # for i in range(len(torques_prev)):
-        #     final_torques.append(
-        #         1.0*(torques_req[i]-torques_prev[i])+0.05*(torques_req[i]-torques_prev[i])/12)
-        p.setJointMotorControlArray(
-            robotId, jointIds, controlMode=p.TORQUE_CONTROL, forces=applied_torque)
-        computed_qdd_wo_damping = robot.computeForwardDynamics(
-            [0]*6+[1]+q, [0]*7 + qd, applied_torque, False)
+        robot.doInverseDynamics([0]*12, [0]*12)
+        # applied_torque = None
+        # print(robot.ik_leg(1, [0.1, 0.1, 0]))
+        # p.setJointMotorControlArray(
+        #     robotId, jointIds, controlMode=p.TORQUE_CONTROL, forces=applied_torque)
+        # print(robot.calculateDynamicMatrices())
         p.stepSimulation()
         time.sleep(1/240.0)
-        prev_q = copy.deepcopy(q)
-        prev_qd = copy.deepcopy(qd)
-        time_count += 1
 
 p.disconnect()
