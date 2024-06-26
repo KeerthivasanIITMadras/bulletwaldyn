@@ -188,8 +188,8 @@ def set_anymal(anymal, base_pos, base_quat, ee1, ee2, ee3, ee4, control):
         #                             )
         # p.stepSimulation()
         angles = leg_LF[0:3]+leg_RF[3:6]+leg_LH[6:9]+leg_RH[9:12]
-    p.setJointMotorControlArray(
-        anymal, control.getcontrollablejointIds(), controlMode=p.TORQUE_CONTROL, forces=tau)
+    # p.setJointMotorControlArray(
+    #     anymal, control.getcontrollablejointIds(), controlMode=p.TORQUE_CONTROL, forces=tau)
     return angles
 
 
@@ -417,11 +417,11 @@ def run_towr_tracking_position_control(target_pos, target_angle, terrain_id, gai
                     tau_contact[6:9] = [tau_contact_4[0],
                                         tau_contact_4[2], tau_contact_4[3]]
                 i += 3
-            tau = list(np.array(tau)+np.array(tau_inv[7:])+0.05*tau_contact)
+            tau = list(np.array(tau_inv[7:])+np.array(tau)-tau_contact)
             p.setJointMotorControlArray(
                 anymal, control.getcontrollablejointIds(), controlMode=p.TORQUE_CONTROL, forces=tau)
             p.stepSimulation()
-            time.sleep(0.01)
+            # time.sleep(0.01)
 
             # p.setJointMotorControlArray(
             #     anymal, control.getcontrollablejointIds(), controlMode=p.TORQUE_CONTROL, forces=tau)
