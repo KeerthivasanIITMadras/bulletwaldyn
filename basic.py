@@ -4,6 +4,7 @@ import pybullet_data
 # from collections import defaultdict
 import numpy as np
 import copy
+from collections import OrderedDict
 
 
 class Robot:
@@ -53,7 +54,7 @@ class Robot:
     def enableTorqueControl(self, jointIds):
         for joint in jointIds:
             self.p.setJointMotorControl2(
-                self.robotId, joint, controlMode=self.p.TORQUE_CONTROL, force=100.0)
+                self.robotId, joint, controlMode=self.p.TORQUE_CONTROL, force=10.0)
 
     def enableTorqueSensor(self, jointIds):
         for joint in jointIds:
@@ -71,8 +72,11 @@ class Robot:
 
     def ik_leg(self, leg_index, ee):
         angles = []
-        angles = self.p.calculateInverseKinematics(
-            self.robotId, (leg_index+1)*5, ee)
+        p.setRealTimeSimulation(False)
+        for i in range(1):
+            angles = self.p.calculateInverseKinematics(
+                self.robotId, (leg_index+1)*5, ee)
+            p.stepSimulation()
         if (leg_index == 0):
             return (angles[0:3])
         elif (leg_index == 1):
@@ -102,63 +106,79 @@ class Robot:
             self.robotId, [0]*6+[1]+joint_pos, [0.0]*7+joint_vel, [0.0] * (n_dof+7), flags=1)) - GravityMatrix
         return InertiaMatrix, GravityMatrix, CoriolisMatrix
 
-    # def getTrajectory(self, thi, thf, tf, dt):
-    #     desired_position, desired_velocity, desired_acceleration = [], [], []
-    #     t = 0
-    #     while t <= tf:
-    #         # th = thi+((thf-thi)/tf)*(t-(tf/(2*np.pi))*np.sin((2*np.pi/tf)*t))
-    #         th = [0]*12
-    #         dth = [0]*12
-    #         ddth = [0]*12
-    #         desired_position.append(th)
-    #         desired_velocity.append(dth)
-    #         desired_acceleration.append(ddth)
-    #         t += dt
-    #     desired_position = np.array(desired_position)
-    #     desired_velocity = np.array(desired_velocity)
-    #     desired_acceleration = np.array(desired_acceleration)
-    #     return desired_position, desired_velocity, desired_acceleration
 
-    # def doInverseDynamics(self, th_initial, th_final, final_time=2):
-    #     self.p.setRealTimeSimulation(False)
-    #     q_d, dq_d, ddq_d = self.getTrajectory(
-    #         th_initial, th_final, tf=final_time, dt=self.time_step)
-    #     traj_points = q_d.shape[0]
-    #     print('#Trajectory points:', traj_points)
-    #     # kd = 0.7
-    #     n = 0
-    #     while n < traj_points:
-    #         tau = self.p.calculateInverseDynamics(
-    #             self.robotId, [0]*6+[1]+list(q_d[n]), [0]*7+list(dq_d[n]), [0]*7+list(ddq_d[n]), flags=1)
-    #         # tau += kd * dq_d[n] #if joint damping is turned off, this torque will not be required
-    #         # print(tau)
-    #         tau = tau[7:]
-    #         # torque control
-    #         p.setJointMotorControlArray(self.robotId, self.getcontrollablejointIds(),
-    #                                     controlMode=self.p.TORQUE_CONTROL,
-    #                                     forces=tau)
-    #         theta, _, _ = self.getJointStates()
-    #         print('n:{}::th:{}'.format(n, theta))
+def getContact(robotID, planeID):
+    contactproperties = p.getContactPoints(robotID, planeID)
+    # 9,10,12
+    forces = OrderedDict()
+    for contact in contactproperties:
+        if contact[3] == 5:
+            forces["LF_FOOT"] = [contact[9], contact[10], contact[12]]
+        if contact[3] == 10:
+            forces["RF_FOOT"] = [contact[9], contact[10], contact[12]]
+        if contact[3] == 15:
+            forces["LH_FOOT"] = [contact[9], contact[10], contact[12]]
+        if contact[3] == 20:
+            forces["RH_FOOT"] = [contact[9], contact[10], contact[12]]
+    return forces
 
-    #         p.stepSimulation()
-    #         time.sleep(self.time_step)
-    #         n += 1
-    #     print('Desired joint angles:', th_final)
-    #     # self.p.disconnect()
+
+def get_sensor_data(robot, joint_id, link_id):
+    sensor_data = OrderedDict()
+    base_pos, base_quat = p.getBasePositionAndOrientation(robot)
+    sensor_data['base_pos'] = np.asarray(base_pos)
+    sensor_data['base_quat'] = np.asarray(base_quat)
+    base_lin_vel, base_ang_vel = p.getBaseVelocity(robot)
+    sensor_data['base_lin_vel'] = np.asarray(base_lin_vel)
+    sensor_data['base_ang_vel'] = np.asarray(base_ang_vel)
+    sensor_data['joint_pos'] = OrderedDict()
+    sensor_data['joint_vel'] = OrderedDict()
+    for k, v in joint_id.items():
+        js = p.getJointState(robot, v)
+        sensor_data['joint_pos'][k] = js[0]
+        sensor_data['joint_vel'][k] = js[1]
+    return sensor_data
+
+
+def get_jacobian(robot, link_idx, sensor_data):
+    link_state = p.getLinkState(robot,
+                                link_idx,
+                                computeLinkVelocity=1,
+                                computeForwardKinematics=1)
+    jpos = list(sensor_data['joint_pos'].values())
+    jvel = list(sensor_data['joint_vel'].values())
+    zeros = [0.] * len(jvel)
+    jac = p.calculateJacobian(robot, link_idx, link_state[2], jpos, zeros,
+                              zeros)
+    nv = len(jac[0][0])
+    ret = np.zeros((6, nv))
+    for row in range(3):
+        for col in range(nv):
+            ret[row, col] = jac[1][row][col]  # angular
+            ret[row + 3, col] = jac[0][row][col]  # linear
+    return ret
+
+
+def get_robot_config(robot):
+    nq, nv, na, joint_id, link_id = 0, 0, 0, OrderedDict(), OrderedDict()
+    link_id[(p.getBodyInfo(robot)[0]).decode("utf-8")] = -1
+    for i in range(p.getNumJoints(robot)):
+        info = p.getJointInfo(robot, i)
+        if info[2] != p.JOINT_FIXED:
+            joint_id[info[1].decode("utf-8")] = info[0]
+        link_id[info[12].decode("utf-8")] = info[0]
+        nq = max(nq, info[3])
+        nv = max(nv, info[4])
+    nq += 1
+    nv += 1
+    na = len(joint_id)
+    return nq, nv, na, joint_id, link_id
 
 
 if __name__ == "__main__":
-    # physicsClient = p.connect(p.GUI)
-    physicsClient = p.connect(p.DIRECT)
+    physicsClient = p.connect(p.GUI)
+    # physicsClient = p.connect(p.DIRECT)
     p.setGravity(0, 0, -9.81)
-    # p.setPhysicsEngineParameter(fixedTimeStep=0.005,
-    #                             numSolverIterations=50,
-    #                             erp=0.2,
-    #                             contactERP=0.2,
-    #                             frictionERP=0.2)
-
-    hz = 240.0
-    dt = 1.0 / hz
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     robotpositon = [0, 0, 0.52]
     robotOrientation = p.getQuaternionFromEuler([0, 0, 0])
@@ -172,38 +192,73 @@ if __name__ == "__main__":
     jointIds = robot.getcontrollablejointIds()
     robot.disableVelocityControl(jointIds)
     robot.enableTorqueControl(jointIds)
-
-    prev_qd = [0.0]*12
-    time_count = 0
-    applied_torque = None
-    kp = 260
-    kd = 10
-    ref_q = [0, 0.3, -0.3]*2+[0, -0.3, 0.3]*2
-    ref_qd = [0.0, 0.0, 0.0]*4
-    num_joints = p.getNumJoints(robotId)
-    end_effector_links = []
-
-    # Iterate through all the joints to find end-effectors
-    for joint_index in range(num_joints):
-        joint_info = p.getJointInfo(robotId, joint_index)
-        link_name = joint_info[12].decode('utf-8')  # Link name
-        print(link_name)
-        # Assuming end-effectors have specific naming or are the last link in each leg chain
-        if 'foot' in link_name.lower() or 'end' in link_name.lower():
-            end_effector_links.append(joint_index)
-    print(end_effector_links)
+    while True:
+        print(robot.calculateDynamicMatrices()[2])
+        p.stepSimulation()
+        time.sleep(1/240.0)
     # while True:
-    #     # robot.doInverseDynamics([0]*12, [0]*12)
-    #     q, qd = robot.getPositionVelocity(jointIds)
-    #     # tau = self.p.calculateInverseDynamics(
-    #     #     self.robotId, [0]*6+[1]+list(q_d[n]), [0]*7+list(dq_d[n]), [0]*7+list(ddq_d[n]), flags=1)
-    #     tau = -kp*(np.array(q)-np.array(ref_q))-kd*(np.array(qd)-np.array(ref_qd))
-    #     # applied_torque = None
-    #     # print(robot.ik_leg(1, [0.1, 0.1, 0]))
-    #     p.setJointMotorControlArray(
-    #         robotId, jointIds, controlMode=p.TORQUE_CONTROL, forces=tau)
-    #     # print(robot.calculateDynamicMatrices())
-    #     p.stepSimulation()
+    #     forces = getContact(robotId, planeID)
+    #     tau_contact = np.zeros(12)
+    #     nq, nv, na, joint_id, link_id = get_robot_config(robotId)
+    #     i = 0
+    #     while i <= 9:
+    #         # angle_pair = q[i:i+3]
+    #         # print(angle_pair)
+    #         sensor_data = get_sensor_data(robotId, joint_id, link_id)
+    #         LF_J = np.array(get_jacobian(
+    #             robotId, link_id['LF_FOOT'], sensor_data))[:, 6:9]
+    #         RF_J = np.array(get_jacobian(
+    #             robotId, link_id['RF_FOOT'], sensor_data))[:, 9:12]
+    #         LH_J = np.array(get_jacobian(
+    #             robotId, link_id['LH_FOOT'], sensor_data))[:, 12:15]
+    #         RH_J = np.array(get_jacobian(
+    #             robotId, link_id['RH_FOOT'], sensor_data))[:, 15:18]
+    #         J = np.concatenate((LF_J, np.concatenate(
+    #             (RF_J, np.concatenate((LH_J, RH_J), axis=1)), axis=1)), axis=1)
+    #         # angle_pair = [angle_pair[0]]+[0]+angle_pair[1:3]
+    #         # J = np.array(kin.robot.jacob0(angle_pair))
+    #         F = [0, 0, -70]
+    #         LF = RF = LH = RH = F
+    #         J_T = np.transpose(J)
+    #         if i == 0:
+    #             if forces.get('LF_FOOT') == None:
+    #                 LF = [0, 0, 0]
+    #             tau_contact_4 = np.dot(J_T, np.array(LF+[0, 0, 0]))
+    #             tau_contact[0:3] = tau_contact_4[0:3]
+    #         if i == 3:
+    #             if forces.get('RF_FOOT') == None:
+    #                 RF = [0, 0, 0]
+    #             tau_contact_4 = np.dot(J_T, np.array(RF+[0, 0, 0]))
+    #             tau_contact[3:6] = tau_contact_4[3:6]
+    #         if i == 6:
+    #             if forces.get('LH_FOOT') == None:
+    #                 LH = [0, 0, 0]
+    #             tau_contact_4 = np.dot(J_T, np.array(LH+[0, 0, 0]))
+    #             tau_contact[6:9] = tau_contact_4[6:9]
+    #         if i == 9:
+    #             if forces.get('RH_FOOT') == None:
+    #                 RH = [0, 0, 0]
+    #             tau_contact_4 = np.dot(J_T, np.array(RH+[0, 0, 0]))
+    #             tau_contact[9:12] = tau_contact_4[9:12]
+    #         i += 3
+    #     prev_q, prev_qd = robot.getPositionVelocity(jointIds)
+        
+    #     kp = 37
+    #     kd = 2*np.sqrt(kp)
+    #     ref_q = [0, 0, 0]*4
+    #     ref_qd = [0.0, 0.0, 0.0]*4
+    #     robot.disableVelocityControl(jointIds)
+    #     robot.enableTorqueControl(jointIds)
+    #     accel_req = kp*(np.array(ref_q)-np.array(prev_q)) + \
+    #         kd*(np.array(ref_qd)-np.array(prev_qd))
+    #     tau_inv = p.calculateInverseDynamics(
+    #         robotId, list(robotpositon)+list(robotOrientation)+list(prev_q), [0]*7+prev_qd, [0]*7+list(accel_req), flags=1)
+    #     tau = np.array(tau_inv[7:])-np.array(tau_contact)
+    #     for i in range(20):
+    #         p.setJointMotorControlArray(
+    #             robotId, robot.getcontrollablejointIds(), controlMode=p.TORQUE_CONTROL, forces=list(tau))
+    #         p.stepSimulation()
+        
     #     time.sleep(1/240.0)
 
 p.disconnect()
